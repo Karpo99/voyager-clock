@@ -6,27 +6,31 @@
 #include <Preferences.h>
 #include <time.h>
 
-/* ===== FONT ===== */
-#include "font/Orbitron_Medium_16.h"
+#include "font/TetrisClock16.h"
+#include "font/TetrisDate8.h"
 
 /* ===== OLED ===== */
-#define SCREEN_WIDTH 64
-#define SCREEN_HEIGHT 32
-#define OLED_ADDR 0x3C
+static const uint8_t SCREEN_WIDTH = 64;
+static const uint8_t SCREEN_HEIGHT = 32;
+static const uint8_t OLED_ADDR = 0x3C;
 
-#define SDA_PIN 21
-#define SCL_PIN 20
+static const uint8_t SDA_PIN = 21;
+static const uint8_t SCL_PIN = 20;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 /* ===== LED ===== */
-#define LED_GREEN  2
-#define LED_YELLOW 3
-#define LED_RED    8
+static const uint8_t LED_GREEN = 2;
+static const uint8_t LED_YELLOW = 3;
+static const uint8_t LED_RED = 8;
 
 /* ===== RESET BUTTON ===== */
-#define BTN_RESET  9
-#define RESET_HOLD_MS 5000
+static const uint8_t BTN_RESET = 9;
+static const unsigned long RESET_HOLD_MS = 5000;
+
+/* ===== WIFI PORTAL ===== */
+static const char* AP_SSID = "Voyager-Clock";
+static const char* AP_PASS = "khrestomatiya";
 
 /* ===== TIME ===== */
 static const char* NTP_SERVER_1 = "pool.ntp.org";
@@ -37,15 +41,52 @@ static const char* NTP_SERVER_3 = "time.google.com";
 Preferences prefs;
 WiFiManager wm;
 
+String selectedCountry = "FI";
+String selectedTzLabel = "Finland / Helsinki";
+
+bool wifiConnected = false;
+bool timeSynced = false;
+
 unsigned long ledTimer = 0;
 int ledStep = 0;
 bool ledEnabled = false;
 
 unsigned long displayTimer = 0;
-const unsigned long DISPLAY_REFRESH_MS = 250;
+static const unsigned long DISPLAY_REFRESH_MS = 100;
+
+unsigned long timeSyncCheckTimer = 0;
+static const unsigned long TIME_SYNC_CHECK_MS = 500;
 
 unsigned long resetPressStart = 0;
 bool resetHandled = false;
+
+/* ===== MARQUEE ===== */
+struct MarqueeState {
+  String text;
+  int16_t x;
+  uint16_t textWidth;
+  unsigned long lastStepMs;
+  unsigned long holdStartMs;
+  bool holdAtEdge;
+};
+
+MarqueeState marquee = {"", 0, 0, 0, 0, false};
+
+static const uint8_t MARQUEE_Y = 24;
+static const uint8_t MARQUEE_STEP_PX = 1;
+static const unsigned long MARQUEE_SPEED_MS = 35;
+static const unsigned long MARQUEE_EDGE_HOLD_MS = 450;
+
+String statusLine1 = "STARTING...";
+String statusLine2 = "";
+
+enum ScreenMode {
+  SCREEN_STATUS,
+  SCREEN_CLOCK,
+  SCREEN_SETUP
+};
+
+ScreenMode currentScreenMode = SCREEN_STATUS;
 
 /* ===== PORTAL UI ===== */
 const char* portal_html = R"(
@@ -53,32 +94,10 @@ const char* portal_html = R"(
 body{background:#000;color:#0f0;font-family:Arial,Helvetica,sans-serif}
 h1{color:#00ffd5;text-align:center;margin-bottom:8px}
 p,div,label{font-size:14px}
-input,select,button{
-  font-size:16px;
-  padding:8px;
-  width:100%;
-  box-sizing:border-box;
-  margin-top:6px;
-  margin-bottom:10px;
-}
-button{
-  background:#00ffd5;
-  color:#000;
-  border:none;
-  font-weight:bold;
-}
-.help{
-  color:#9ff;
-  font-size:13px;
-  margin-top:10px;
-  line-height:1.4;
-}
-.card{
-  border:1px solid #00ffd5;
-  padding:12px;
-  border-radius:8px;
-  margin-top:12px;
-}
+input,select,button{font-size:16px;padding:8px;width:100%;box-sizing:border-box;margin-top:6px;margin-bottom:10px;}
+button{background:#00ffd5;color:#000;border:none;font-weight:bold;}
+.help{color:#9ff;font-size:13px;margin-top:10px;line-height:1.4;}
+.card{border:1px solid #00ffd5;padding:12px;border-radius:8px;margin-top:12px;}
 </style>
 <h1>VOYAGER CLOCK</h1>
 <div class='card'>
@@ -103,22 +122,19 @@ struct TimeZoneOption {
 };
 
 static const TimeZoneOption TIMEZONES[] = {
-  {"FI", "Finland / Helsinki",     "EET-2EEST,M3.5.0/3,M10.5.0/4"},
-  {"SE", "Sweden / Stockholm",     "CET-1CEST,M3.5.0/2,M10.5.0/3"},
-  {"DE", "Germany / Berlin",       "CET-1CEST,M3.5.0/2,M10.5.0/3"},
-  {"UA", "Ukraine / Kyiv",         "EET-2EEST,M3.5.0/3,M10.5.0/4"},
-  {"PL", "Poland / Warsaw",        "CET-1CEST,M3.5.0/2,M10.5.0/3"},
-  {"NL", "Netherlands / Amsterdam","CET-1CEST,M3.5.0/2,M10.5.0/3"}
+  {"FI", "Finland / Helsinki", "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+  {"SE", "Sweden / Stockholm", "CET-1CEST,M3.5.0/2,M10.5.0/3"},
+  {"DE", "Germany / Berlin", "CET-1CEST,M3.5.0/2,M10.5.0/3"},
+  {"UA", "Ukraine / Kyiv", "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+  {"PL", "Poland / Warsaw", "CET-1CEST,M3.5.0/2,M10.5.0/3"},
+  {"NL", "Netherlands / Amsterdam", "CET-1CEST,M3.5.0/2,M10.5.0/3"}
 };
 
 const size_t TIMEZONE_COUNT = sizeof(TIMEZONES) / sizeof(TIMEZONES[0]);
 
-/* ===================================================== */
-
 void normalizeCountryCode(char* code) {
   if (!code) return;
-
-  for (int i = 0; code[i] != '\0'; i++) {
+  for (size_t i = 0; code[i] != '\0'; i++) {
     if (code[i] >= 'a' && code[i] <= 'z') {
       code[i] = code[i] - 'a' + 'A';
     }
@@ -126,7 +142,7 @@ void normalizeCountryCode(char* code) {
 }
 
 const TimeZoneOption* findTimeZone(const char* code) {
-  if (!code) return &TIMEZONES[0];
+  if (!code || code[0] == '\0') return &TIMEZONES[0];
 
   for (size_t i = 0; i < TIMEZONE_COUNT; i++) {
     if (strcasecmp(code, TIMEZONES[i].code) == 0) {
@@ -139,7 +155,22 @@ const TimeZoneOption* findTimeZone(const char* code) {
 
 void applyTimeZone(const char* countryCode) {
   const TimeZoneOption* tz = findTimeZone(countryCode);
+  selectedCountry = tz->code;
+  selectedTzLabel = tz->label;
   configTzTime(tz->posixTz, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+}
+
+void saveSettings(const char* countryCode) {
+  const TimeZoneOption* tz = findTimeZone(countryCode);
+  prefs.putString("country", tz->code);
+}
+
+void loadSettings() {
+  String storedCountry = prefs.getString("country", "FI");
+  storedCountry.toUpperCase();
+  const TimeZoneOption* tz = findTimeZone(storedCountry.c_str());
+  selectedCountry = tz->code;
+  selectedTzLabel = tz->label;
 }
 
 bool isTimeValid() {
@@ -150,29 +181,81 @@ bool isTimeValid() {
   return timeinfo.tm_year > (2024 - 1900);
 }
 
-void drawCenteredText(const String& text, int y, const GFXfont* font) {
-  int16_t x1, y1;
-  uint16_t w, h;
-
-  display.setFont(font);
-  display.getTextBounds(text, 0, y, &x1, &y1, &w, &h);
-  int x = (display.width() - (int)w) / 2;
-  display.setCursor(x, y);
-  display.print(text);
+void setMarqueeText(const String& message) {
+  marquee.text = message;
+  marquee.textWidth = message.length() * 6;
+  marquee.x = display.width();
+  marquee.lastStepMs = millis();
+  marquee.holdStartMs = 0;
+  marquee.holdAtEdge = false;
 }
 
-void showBootScreen(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr) {
+void drawMarquee() {
+  if (marquee.text.length() == 0) return;
+
+  display.setFont();
+  display.setTextSize(1);
+  display.setCursor(marquee.x, MARQUEE_Y);
+  display.print(marquee.text);
+
+  if (marquee.textWidth <= display.width()) {
+    marquee.x = (display.width() - marquee.textWidth) / 2;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (marquee.holdAtEdge) {
+    if (now - marquee.holdStartMs >= MARQUEE_EDGE_HOLD_MS) {
+      marquee.holdAtEdge = false;
+      marquee.lastStepMs = now;
+    }
+    return;
+  }
+
+  if (now - marquee.lastStepMs < MARQUEE_SPEED_MS) return;
+
+  marquee.lastStepMs = now;
+  marquee.x -= MARQUEE_STEP_PX;
+
+  if (marquee.x <= -(int16_t)marquee.textWidth) {
+    marquee.x = display.width();
+    marquee.holdAtEdge = true;
+    marquee.holdStartMs = now;
+  }
+}
+
+void drawStatusScreen() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setFont();
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println(statusLine1);
+
+  if (statusLine2.length() > 0) {
+    if (statusLine2.length() <= 10) {
+      display.setCursor(0, 12);
+      display.print(statusLine2);
+    } else {
+      drawMarquee();
+    }
+  }
+
+  display.display();
+}
+
+void drawSetupScreen() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setFont();
+  display.setTextSize(1);
 
   display.setCursor(0, 0);
   display.println("VOYAGER CLOCK");
-  display.println();
+  display.println("SETUP MODE");
 
-  if (line1) display.println(line1);
-  if (line2) display.println(line2);
-  if (line3) display.println(line3);
+  drawMarquee();
 
   display.display();
 }
@@ -181,22 +264,12 @@ void drawClockVertical() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  if (!isTimeValid()) {
-    display.setFont();
-    display.setCursor(0, 0);
-    display.println("VOYAGER CLOCK");
-    display.println();
-    display.println("SYNCING TIME...");
-    display.display();
-    return;
-  }
-
   struct tm timeinfo{};
   if (!getLocalTime(&timeinfo, 100)) {
-    display.setFont();
-    display.setCursor(0, 0);
-    display.println("TIME ERROR");
-    display.display();
+    statusLine1 = "TIME ERROR";
+    statusLine2 = "SYNCING TIME...";
+    setMarqueeText(statusLine2);
+    drawStatusScreen();
     return;
   }
 
@@ -208,28 +281,36 @@ void drawClockVertical() {
   strftime(mm, sizeof(mm), "%M", &timeinfo);
   strftime(dateBuf, sizeof(dateBuf), "%d.%m", &timeinfo);
 
-  const int centerY = display.height() / 2;
+  const uint16_t hhWidth = TetrisClock16::textWidth(hh);
+  const uint16_t mmWidth = TetrisClock16::textWidth(mm);
 
-  display.setFont(&Orbitron_Medium_16);
+  const int16_t hhX = (display.width() - hhWidth) / 2;
+  const int16_t mmX = (display.width() - mmWidth) / 2;
 
-  int16_t x1, y1;
-  uint16_t w1, h1;
+  TetrisClock16::drawText(display, hhX, 0, hh);
+  display.drawFastHLine(8, 16, display.width() - 16, SSD1306_WHITE);
+  TetrisClock16::drawText(display, mmX, 17, mm);
 
-  display.getTextBounds(hh, 0, 0, &x1, &y1, &w1, &h1);
-  int timeX = (display.width() - (int)w1) / 2;
-
-  display.setCursor(timeX, centerY - 4);
-  display.print(hh);
-
-  display.drawLine(10, centerY + 2, display.width() - 10, centerY + 2, SSD1306_WHITE);
-
-  display.setCursor(timeX, centerY + 24);
-  display.print(mm);
-
-  display.setFont();
-  drawCenteredText(String(dateBuf), display.height() - 1, nullptr);
+  const uint16_t dateWidth = TetrisDate8::textWidth(dateBuf);
+  const int16_t dateX = (display.width() - dateWidth) / 2;
+  TetrisDate8::drawText(display, dateX, 24, dateBuf);
 
   display.display();
+}
+
+void renderScreen() {
+  switch (currentScreenMode) {
+    case SCREEN_SETUP:
+      drawSetupScreen();
+      break;
+    case SCREEN_STATUS:
+      drawStatusScreen();
+      break;
+    case SCREEN_CLOCK:
+    default:
+      drawClockVertical();
+      break;
+  }
 }
 
 void ledPattern() {
@@ -240,7 +321,7 @@ void ledPattern() {
     return;
   }
 
-  unsigned long now = millis();
+  const unsigned long now = millis();
 
   digitalWrite(LED_GREEN, LOW);
   digitalWrite(LED_YELLOW, LOW);
@@ -287,7 +368,7 @@ void ledPattern() {
       }
       break;
 
-    case 5:
+    default:
       if (now - ledTimer >= 1000) {
         ledTimer = now;
         ledStep = 0;
@@ -297,7 +378,11 @@ void ledPattern() {
 }
 
 void clearSettingsAndRestart() {
-  showBootScreen("RESETTING...", "CLEARING WIFI", "PLEASE WAIT");
+  currentScreenMode = SCREEN_STATUS;
+  statusLine1 = "RESETTING...";
+  statusLine2 = "CLEARING WIFI + NVS";
+  setMarqueeText(statusLine2);
+  renderScreen();
 
   wm.resetSettings();
   prefs.clear();
@@ -307,7 +392,7 @@ void clearSettingsAndRestart() {
 }
 
 void handleResetButton() {
-  int state = digitalRead(BTN_RESET);
+  const int state = digitalRead(BTN_RESET);
 
   if (state == LOW) {
     if (resetPressStart == 0) {
@@ -315,9 +400,8 @@ void handleResetButton() {
       resetHandled = false;
     }
 
-    unsigned long held = millis() - resetPressStart;
-
-    if (!resetHandled && held >= RESET_HOLD_MS) {
+    const unsigned long heldMs = millis() - resetPressStart;
+    if (!resetHandled && heldMs >= RESET_HOLD_MS) {
       resetHandled = true;
       clearSettingsAndRestart();
     }
@@ -327,17 +411,11 @@ void handleResetButton() {
   }
 }
 
-void waitForTimeSync() {
-  unsigned long start = millis();
-
-  while (!isTimeValid() && millis() - start < 15000) {
-    drawClockVertical();
-    handleResetButton();
-    delay(100);
-  }
+void onConfigPortalStart(WiFiManager* manager) {
+  (void)manager;
+  currentScreenMode = SCREEN_SETUP;
+  setMarqueeText(String("SSID: ") + AP_SSID + "  PASS: " + AP_PASS);
 }
-
-/* ===================================================== */
 
 void setup() {
   Serial.begin(115200);
@@ -362,61 +440,82 @@ void setup() {
   display.setRotation(1);
   display.setTextColor(SSD1306_WHITE);
 
-  showBootScreen("Starting...");
-
   prefs.begin("voyager", false);
+  loadSettings();
+
+  currentScreenMode = SCREEN_STATUS;
+  statusLine1 = "STARTING...";
+  statusLine2 = "INIT WIFI";
+  setMarqueeText(statusLine2);
+  renderScreen();
 
   char savedCountry[4] = "FI";
-  String storedCountry = prefs.getString("country", "FI");
-  storedCountry.toUpperCase();
-  storedCountry.toCharArray(savedCountry, sizeof(savedCountry));
+  selectedCountry.toCharArray(savedCountry, sizeof(savedCountry));
 
-  WiFiManagerParameter param_country(
+  WiFiManagerParameter paramCountry(
     "country",
     "Country code (FI/SE/DE/UA/PL/NL)",
     savedCountry,
     3
   );
 
-  showBootScreen("WIFI SETUP", "", "AP: Voyager-Clock");
-
   wm.setCustomHeadElement(portal_html);
-  wm.addParameter(&param_country);
+  wm.setAPCallback(onConfigPortalStart);
   wm.setConfigPortalTimeout(180);
+  wm.addParameter(&paramCountry);
 
-  bool ok = wm.autoConnect("Voyager-Clock");
-
+  bool ok = wm.autoConnect(AP_SSID, AP_PASS);
   if (!ok) {
     ESP.restart();
   }
 
+  wifiConnected = true;
+  ledEnabled = true;
+  ledTimer = millis();
+  ledStep = 0;
+
   char countryCode[4];
-  strncpy(countryCode, param_country.getValue(), sizeof(countryCode) - 1);
+  strncpy(countryCode, paramCountry.getValue(), sizeof(countryCode) - 1);
   countryCode[sizeof(countryCode) - 1] = '\0';
   normalizeCountryCode(countryCode);
 
   const TimeZoneOption* tz = findTimeZone(countryCode);
-  prefs.putString("country", tz->code);
-
-  showBootScreen("WIFI OK", WiFi.localIP().toString().c_str(), tz->label);
-  delay(1500);
-
+  saveSettings(tz->code);
   applyTimeZone(tz->code);
 
-  showBootScreen("SYNCING TIME...", tz->label);
-  waitForTimeSync();
+  statusLine1 = "CONNECTED";
+  statusLine2 = String(WiFi.localIP().toString()) + " " + tz->label;
+  currentScreenMode = SCREEN_STATUS;
+  setMarqueeText(statusLine2);
+  renderScreen();
+  delay(800);
 
-  ledEnabled = true;
-  ledTimer = millis();
-  ledStep = 0;
+  statusLine1 = "SYNCING TIME...";
+  statusLine2 = tz->label;
+  setMarqueeText(statusLine2);
+  currentScreenMode = SCREEN_STATUS;
 }
 
 void loop() {
   handleResetButton();
 
+  if (!timeSynced && wifiConnected && millis() - timeSyncCheckTimer >= TIME_SYNC_CHECK_MS) {
+    timeSyncCheckTimer = millis();
+    timeSynced = isTimeValid();
+
+    if (timeSynced) {
+      currentScreenMode = SCREEN_CLOCK;
+    } else {
+      currentScreenMode = SCREEN_STATUS;
+      statusLine1 = "SYNCING TIME...";
+      statusLine2 = selectedTzLabel;
+      setMarqueeText(statusLine2);
+    }
+  }
+
   if (millis() - displayTimer >= DISPLAY_REFRESH_MS) {
     displayTimer = millis();
-    drawClockVertical();
+    renderScreen();
   }
 
   ledPattern();
